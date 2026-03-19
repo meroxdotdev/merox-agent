@@ -33,6 +33,7 @@ echo "==> Creating Python virtualenv at $VENV ..."
 python3 -m venv "$VENV"
 "$PYTHON" -m pip install --upgrade pip --quiet
 "$PYTHON" -m pip install -r "$AGENT_DIR/requirements.txt"
+"$PYTHON" -c "import claude_agent_sdk, fastapi, uvicorn, telegram; print('All packages OK')"
 
 # ── Claude Code permissions ───────────────────────────────────────────────────
 
