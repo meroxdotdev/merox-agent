@@ -1,1 +1,7 @@
+# Server (runs on Oracle Cloud)
 anthropic>=0.40.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+
+# Client (runs on any device with Tailscale)
+httpx>=0.28.0

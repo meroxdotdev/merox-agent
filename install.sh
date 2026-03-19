@@ -1,31 +1,35 @@
 #!/bin/bash
-# Merox Agent — install script
-# Run once after cloning the repo on a new machine.
+# Merox Agent — server install script
+# Run on the Oracle Cloud server after cloning.
 set -euo pipefail
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAUNCHER="/usr/local/bin/merox-agent"
 
 echo "==> Installing Python dependencies..."
 pip3 install -r "$AGENT_DIR/requirements.txt" --quiet
 
-echo "==> Creating launcher at $LAUNCHER..."
-cat > "$LAUNCHER" << EOF
+echo "==> Installing systemd service..."
+cp "$AGENT_DIR/merox-agent.service" /etc/systemd/system/merox-agent.service
+systemctl daemon-reload
+systemctl enable merox-agent
+systemctl restart merox-agent
+
+echo "==> Creating client launcher /usr/local/bin/merox-agent..."
+cat > /usr/local/bin/merox-agent << EOF
 #!/bin/bash
-# Auto-load .env if present next to agent.py
-if [ -f "$AGENT_DIR/.env" ]; then
-    set -o allexport
-    source "$AGENT_DIR/.env"
-    set +o allexport
-fi
-exec python3 "$AGENT_DIR/agent.py" "\$@"
+exec python3 $AGENT_DIR/client.py "\$@"
 EOF
-chmod +x "$LAUNCHER"
+chmod +x /usr/local/bin/merox-agent
 
 echo ""
-echo "✓ Done. Setup:"
-echo "  1. cp $AGENT_DIR/.env.example $AGENT_DIR/.env"
-echo "  2. Edit .env — add your ANTHROPIC_API_KEY"
-echo "  3. Run: merox-agent"
+echo "✓ Done!"
 echo ""
-echo "  NOTE: Tailscale must be connected to reach the cluster remotely."
+echo "Check service:  systemctl status merox-agent"
+echo "Local client:   merox-agent"
+echo ""
+echo "─── On any other device (laptop etc.) ───────────────────────────────"
+echo "  1. Connect Tailscale"
+echo "  2. pip install httpx"
+echo "  3. Copy client.py here"
+echo "  4. echo 'AGENT_SERVER_URL=http://100.72.22.38:8765' > .env"
+echo "  5. python3 client.py"
