@@ -1,7 +1,10 @@
-# Server (runs on Oracle Cloud)
-anthropic>=0.40.0
+# Server (runs on Oracle Cloud) — service.py
+claude-agent-sdk>=0.0.1
 fastapi>=0.115.0
 uvicorn>=0.34.0
 
-# Client (runs on any device with Tailscale)
+# Local agent (optional, agent.py) — requires ANTHROPIC_API_KEY
+# anthropic>=0.40.0
+
+# Client (runs on any device with Tailscale) — client.py
 httpx>=0.28.0

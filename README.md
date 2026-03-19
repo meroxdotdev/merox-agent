@@ -5,12 +5,13 @@ Intelligent CLI agent for managing the merox.dev homelab infrastructure:
 - **Kubernetes cluster** — Talos OS, FluxCD GitOps, Longhorn
 - **Website** — merox.dev source at github.com/meroxdotdev/merox
 
-Built with the [Anthropic Claude API](https://docs.anthropic.com).
+Built with the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) — uses your **Claude Code account**, no separate API key needed.
 
 ## Requirements
 
 - Python 3.11+
-- An [Anthropic API key](https://console.anthropic.com)
+- Node.js 18+ (for Claude Code CLI)
+- **Claude Code CLI** — authenticated with your account
 - **Tailscale** — required to reach the Oracle server and K8s cluster remotely
 
 ## Setup
@@ -19,14 +20,20 @@ Built with the [Anthropic Claude API](https://docs.anthropic.com).
 git clone https://github.com/meroxdotdev/merox-agent
 cd merox-agent
 
-# Install deps + create /usr/local/bin/merox-agent launcher
+# 1. Install Claude Code CLI (if not already installed)
+npm install -g @anthropic-ai/claude-code
+
+# 2. Authenticate once (follow the login prompts)
+claude
+
+# 3. Install deps + create /usr/local/bin/merox-agent launcher
 sudo bash install.sh
 
-# Configure
+# 4. Configure
 cp .env.example .env
-# edit .env — set ANTHROPIC_API_KEY
+# edit .env — set SERVER_TS_IP, SERVER_NAME, etc. (no API key needed)
 
-# Run
+# 5. Run
 merox-agent
 ```
 
@@ -48,7 +55,6 @@ exit    # quit
 what is the status of the cluster?
 show me all pods that are not running
 what does the longhorn helmrelease look like?
-run task longhorn:status
 reconcile flux-system
 
 # Server
@@ -70,18 +76,29 @@ what's the last commit on the website repo?
 
 ```
 merox-agent/
-├── agent.py          # main entry point + agentic loop
+├── agent.py          # standalone local agent (uses Anthropic API directly)
+├── service.py        # HTTP server (uses Claude Agent SDK — no API key)
+├── client.py         # thin remote client (connects to service.py over Tailscale)
 ├── config.py         # all configuration (env var overrides)
 ├── prompt.py         # system prompt with infra context
 ├── tools/
-│   ├── kubernetes.py # kubectl, flux, talosctl
-│   ├── server.py     # docker, systemctl, read/write files, shell
-│   └── git_tools.py  # git status, diff, commit, push
+│   ├── kubernetes.py # kubectl, flux, talosctl (used by agent.py)
+│   ├── server.py     # docker, systemctl, shell (used by agent.py)
+│   └── git_tools.py  # git status, diff, commit, push (used by agent.py)
 ├── install.sh        # setup script
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
 ```
+
+## Two modes
+
+| Mode | File | Auth | Use case |
+|------|------|------|----------|
+| Local agent | `agent.py` | `ANTHROPIC_API_KEY` | Direct SSH access to server |
+| HTTP service | `service.py` | Claude Code CLI login | Remote via Tailscale from any device |
+
+The **HTTP service** (`service.py`) is the recommended mode — run it once on the Oracle server and connect from any device via `client.py`.
 
 ## Security
 
@@ -91,10 +108,9 @@ merox-agent/
 
 ## Tailscale note
 
-This agent runs on the Oracle Cloud server. To use it from another machine:
+The service runs on the Oracle Cloud server. To connect from another device:
 1. Connect your device to Tailscale
-2. SSH to the server: `ssh user@100.72.22.38` (or use the hostname)
-3. Run `merox-agent`
+2. `pip install httpx && python3 client.py`
 
 The cluster nodes are also on the Tailscale network, so all `kubectl`/`flux`/`talosctl`
-commands work transparently once you're connected.
+commands work transparently once connected.

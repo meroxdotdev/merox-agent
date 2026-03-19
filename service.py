@@ -1,55 +1,46 @@
 #!/usr/bin/env python3
 """
-Merox Agent — HTTP service mode.
+Merox Agent — HTTP service mode (Claude Agent SDK).
 
 Runs on the Oracle server, listens on Tailscale IP only.
 The thin client (client.py) connects from any device.
 
-Start: python3 service.py
-       uvicorn service:app --host 0.0.0.0 --port 8765
+Requirements:
+    pip install claude-agent-sdk fastapi uvicorn
+
+Start:
+    python3 service.py
+    uvicorn service:app --host 0.0.0.0 --port 8765
 """
-import asyncio
 import json
 import os
 import uuid
 from collections import defaultdict
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-import anthropic
-
-from config import MODEL, MAX_TOKENS
-from prompt import SYSTEM_PROMPT
-from tools import kubernetes, server, git_tools
-
-# ── Tool registry (shared with agent.py) ──────────────────────────────────────
-
-ALL_TOOLS = (
-    kubernetes.DEFINITIONS
-    + server.DEFINITIONS
-    + git_tools.DEFINITIONS
+from claude_agent_sdk import (
+    query,
+    ClaudeAgentOptions,
+    ResultMessage,
+    AssistantMessage,
+    TextBlock,
+    ToolUseBlock,
+    SystemMessage,
+    CLINotFoundError,
+    CLIConnectionError,
 )
 
-_HANDLERS = {
-    **{t["name"]: lambda i, _n=t["name"]: kubernetes.handle(_n, i) for t in kubernetes.DEFINITIONS},
-    **{t["name"]: lambda i, _n=t["name"]: server.handle(_n, i)     for t in server.DEFINITIONS},
-    **{t["name"]: lambda i, _n=t["name"]: git_tools.handle(_n, i)  for t in git_tools.DEFINITIONS},
-}
+from config import MODEL
+from prompt import SYSTEM_PROMPT
 
-
-def dispatch(name: str, inp: dict) -> str:
-    h = _HANDLERS.get(name)
-    return h(inp) if h else f"Unknown tool: {name}"
-
-
-# ── Session store (in-memory, resets on restart) ──────────────────────────────
-
-_sessions: dict[str, list] = defaultdict(list)
-
+# ── Session store ─────────────────────────────────────────────────────────────
+# Maps our session_id → Claude CLI session_id (for resumption)
+_sessions: dict[str, str] = {}
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -68,22 +59,14 @@ class ChatRequest(BaseModel):
     session_id: str = ""  # empty = new session
 
 
-class SessionResponse(BaseModel):
-    session_id: str
-    message_count: int
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL}
+    return {"status": "ok", "sdk": "claude-agent-sdk", "model": MODEL}
 
 
 @app.get("/sessions")
 def list_sessions():
-    return [
-        {"session_id": sid, "messages": len(msgs)}
-        for sid, msgs in _sessions.items()
-    ]
+    return [{"session_id": sid} for sid in _sessions]
 
 
 @app.delete("/sessions/{session_id}")
@@ -95,52 +78,53 @@ def clear_session(session_id: str):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     """Stream a response as Server-Sent Events (SSE)."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(503, "ANTHROPIC_API_KEY not set on server")
-
     session_id = req.session_id or str(uuid.uuid4())
+    claude_session_id = _sessions.get(session_id)
 
     async def stream() -> AsyncGenerator[str, None]:
-        # Send session_id first so client can reuse it
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
 
-        conversation = list(_sessions[session_id])
-        conversation.append({"role": "user", "content": req.message})
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            allowed_tools=["Bash"],
+            permission_mode="bypassPermissions",
+            model=MODEL,
+            resume=claude_session_id,  # None on first turn = new session
+        )
 
-        client = anthropic.Anthropic()
+        captured_claude_session = None
+        full_text = ""
 
-        while True:
-            response = await asyncio.to_thread(
-                client.messages.create,
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                tools=ALL_TOOLS,
-                messages=conversation,
-            )
-            conversation.append({"role": "assistant", "content": response.content})
+        try:
+            async for message in query(prompt=req.message, options=options):
 
-            if response.stop_reason == "tool_use":
-                results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        # Notify client which tool is running
-                        yield f"data: {json.dumps({'type': 'tool', 'name': block.name, 'input': block.input})}\n\n"
-                        result = await asyncio.to_thread(dispatch, block.name, block.input)
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        })
-                conversation.append({"role": "user", "content": results})
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    captured_claude_session = message.data.get("session_id")
 
-            else:
-                text = next((b.text for b in response.content if b.type == "text"), "")
-                yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
-                break
+                elif isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            full_text += block.text
+                            yield f"data: {json.dumps({'type': 'text', 'content': block.text})}\n\n"
+                        elif isinstance(block, ToolUseBlock):
+                            yield f"data: {json.dumps({'type': 'tool', 'name': block.name, 'input': block.input})}\n\n"
 
-        # Persist conversation
-        _sessions[session_id] = conversation
+                elif isinstance(message, ResultMessage):
+                    # Fallback: some SDK versions only emit ResultMessage
+                    if message.result and not full_text:
+                        full_text = message.result
+                        yield f"data: {json.dumps({'type': 'text', 'content': message.result})}\n\n"
+
+        except CLINotFoundError:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code'})}\n\n"
+        except CLIConnectionError as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'CLI connection error: {e}'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        if captured_claude_session:
+            _sessions[session_id] = captured_claude_session
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -156,5 +140,5 @@ if __name__ == "__main__":
     port = int(os.getenv("AGENT_PORT", "8765"))
 
     print(f"Starting Merox Agent service on {host}:{port}")
-    print("Connect from any Tailscale device with: merox-agent (client.py)")
+    print("Uses Claude Code CLI — no ANTHROPIC_API_KEY needed.")
     uvicorn.run("service:app", host=host, port=port, reload=False)

@@ -91,6 +91,7 @@ def send_message(message: str, session_id: str) -> str:
         timeout=120,
     ) as response:
         if response.status_code != 200:
+            response.read()
             raise RuntimeError(f"Server error {response.status_code}: {response.text}")
 
         for line in response.iter_lines():
