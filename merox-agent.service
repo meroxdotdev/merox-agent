@@ -11,6 +11,8 @@ EnvironmentFile=/srv/merox-agent/.env
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Install]
 WantedBy=multi-user.target
