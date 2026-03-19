@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Merox Agent — HTTP service mode (Claude Agent SDK).
+Merox Agent — HTTP service + Telegram bot.
 
-Runs on the Oracle server, listens on Tailscale IP only.
-The thin client (client.py) connects from any device.
+Runs on the Oracle server. The HTTP endpoint serves client.py (SSE streaming).
+The Telegram bot allows chatting with the agent directly from your phone.
 
 Requirements:
-    pip install claude-agent-sdk fastapi uvicorn
+    pip install claude-agent-sdk fastapi uvicorn python-telegram-bot
 
 Start:
     python3 service.py
-    uvicorn service:app --host 0.0.0.0 --port 8765
 """
+import asyncio
 import json
 import os
 import uuid
-from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
@@ -38,13 +38,166 @@ from claude_agent_sdk import (
 from config import MODEL
 from prompt import SYSTEM_PROMPT
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
+
 # ── Session store ─────────────────────────────────────────────────────────────
 # Maps our session_id → Claude CLI session_id (for resumption)
 _sessions: dict[str, str] = {}
 
+# ── Shared agent runner ───────────────────────────────────────────────────────
+
+async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None]:
+    """Run the agent and yield event dicts (type, content/name/input)."""
+    claude_session_id = _sessions.get(session_key)
+
+    options = ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        allowed_tools=["Bash"],
+        permission_mode="default",
+        model=MODEL,
+        resume=claude_session_id,
+    )
+
+    captured_session = None
+    full_text = ""
+
+    try:
+        async for msg in query(prompt=message, options=options):
+            if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                captured_session = msg.data.get("session_id")
+
+            elif isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        full_text += block.text
+                        yield {"type": "text", "content": block.text}
+                    elif isinstance(block, ToolUseBlock):
+                        yield {"type": "tool", "name": block.name, "input": block.input}
+
+            elif isinstance(msg, ResultMessage):
+                if getattr(msg, "is_error", False):
+                    yield {"type": "error", "content": msg.result or "Agent returned an error"}
+                elif msg.result and not full_text:
+                    full_text = msg.result
+                    yield {"type": "text", "content": msg.result}
+
+    except CLINotFoundError:
+        yield {"type": "error", "content": "Claude CLI not found. Run: npm install -g @anthropic-ai/claude-code"}
+    except CLIConnectionError as e:
+        yield {"type": "error", "content": f"CLI connection error: {e}"}
+    except Exception as e:
+        yield {"type": "error", "content": f"{type(e).__name__}: {e}"}
+
+    if captured_session:
+        _sessions[session_key] = captured_session
+
+
+# ── Telegram bot ──────────────────────────────────────────────────────────────
+
+async def _tg_agent_reply(user_message: str, session_key: str) -> str:
+    """Collect full agent response for Telegram (non-streaming)."""
+    parts = []
+    async for event in run_agent(user_message, session_key):
+        if event["type"] == "text":
+            parts.append(event["content"])
+        elif event["type"] == "error":
+            parts.append(f"❌ {event['content']}")
+    return "".join(parts) or "No response."
+
+
+async def _tg_send(bot, chat_id: int, text: str):
+    """Send message, try Markdown first, fall back to plain text."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=text)
+
+
+async def start_telegram_bot():
+    from telegram import Update
+    from telegram.constants import ChatAction
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+    async def _only_me(update: Update) -> bool:
+        return update.effective_user and update.effective_user.id == TELEGRAM_USER_ID
+
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _only_me(update):
+            return
+        await update.message.reply_text(
+            "👋 Merox Agent ready.\n\nAsk me anything about your infra — cluster, pods, services, logs.\n\n/clear — reset conversation"
+        )
+
+    async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _only_me(update):
+            return
+        key = f"tg_{update.effective_user.id}"
+        _sessions.pop(key, None)
+        await update.message.reply_text("🗑 Session cleared.")
+
+    async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _only_me(update):
+            return
+
+        key = f"tg_{update.effective_user.id}"
+        chat_id = update.effective_chat.id
+
+        # Keep typing indicator alive while agent runs
+        stop_typing = asyncio.Event()
+
+        async def typing_loop():
+            while not stop_typing.is_set():
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(typing_loop())
+        try:
+            reply = await _tg_agent_reply(update.message.text, key)
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+
+        # Split if over Telegram's 4096 char limit
+        for i in range(0, max(len(reply), 1), 4096):
+            await _tg_send(context.bot, chat_id, reply[i:i + 4096])
+
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("clear", cmd_clear))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+    print("Telegram bot polling started.")
+
+    try:
+        await asyncio.Event().wait()  # run forever
+    finally:
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Merox Agent", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if TELEGRAM_TOKEN and TELEGRAM_USER_ID:
+        tg_task = asyncio.create_task(start_telegram_bot())
+        print(f"Telegram bot enabled for user {TELEGRAM_USER_ID}.")
+    else:
+        tg_task = None
+        print("Telegram bot disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_USER_ID not set).")
+    yield
+    if tg_task:
+        tg_task.cancel()
+
+
+app = FastAPI(title="Merox Agent", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,12 +209,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = ""  # empty = new session
+    session_id: str = ""
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "sdk": "claude-agent-sdk", "model": MODEL}
+    return {"status": "ok", "telegram": bool(TELEGRAM_TOKEN), "model": MODEL}
 
 
 @app.get("/sessions")
@@ -70,64 +223,20 @@ def list_sessions():
 
 
 @app.delete("/sessions/{session_id}")
-def clear_session(session_id: str):
+def delete_session(session_id: str):
     _sessions.pop(session_id, None)
     return {"cleared": session_id}
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """Stream a response as Server-Sent Events (SSE)."""
+    """Stream agent response as Server-Sent Events."""
     session_id = req.session_id or str(uuid.uuid4())
-    claude_session_id = _sessions.get(session_id)
 
     async def stream() -> AsyncGenerator[str, None]:
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
-
-        options = ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT,
-            allowed_tools=["Bash"],
-            permission_mode="bypassPermissions",
-            model=MODEL,
-            resume=claude_session_id,  # None on first turn = new session
-        )
-
-        captured_claude_session = None
-        full_text = ""
-
-        try:
-            async for message in query(prompt=req.message, options=options):
-
-                if isinstance(message, SystemMessage) and message.subtype == "init":
-                    captured_claude_session = message.data.get("session_id")
-
-                elif isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock) and block.text:
-                            full_text += block.text
-                            yield f"data: {json.dumps({'type': 'text', 'content': block.text})}\n\n"
-                        elif isinstance(block, ToolUseBlock):
-                            yield f"data: {json.dumps({'type': 'tool', 'name': block.name, 'input': block.input})}\n\n"
-
-                elif isinstance(message, ResultMessage):
-                    if getattr(message, "is_error", False):
-                        err_text = message.result or "Agent returned an error"
-                        yield f"data: {json.dumps({'type': 'error', 'content': err_text})}\n\n"
-                    elif message.result and not full_text:
-                        # Fallback: some SDK versions only emit ResultMessage
-                        full_text = message.result
-                        yield f"data: {json.dumps({'type': 'text', 'content': message.result})}\n\n"
-
-        except CLINotFoundError:
-            yield f"data: {json.dumps({'type': 'error', 'content': 'Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code'})}\n\n"
-        except CLIConnectionError as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': f'CLI connection error: {e}'})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': f'{type(e).__name__}: {e}'})}\n\n"
-
-        if captured_claude_session:
-            _sessions[session_id] = captured_claude_session
-
+        async for event in run_agent(req.message, session_id):
+            yield f"data: {json.dumps(event)}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -141,7 +250,5 @@ if __name__ == "__main__":
 
     host = SERVER_TS_IP or "0.0.0.0"
     port = int(os.getenv("AGENT_PORT", "8765"))
-
-    print(f"Starting Merox Agent service on {host}:{port}")
-    print("Uses Claude Code CLI — no ANTHROPIC_API_KEY needed.")
+    print(f"Starting Merox Agent on {host}:{port}")
     uvicorn.run("service:app", host=host, port=port, reload=False)
