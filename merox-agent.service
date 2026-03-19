@@ -6,8 +6,9 @@ Wants=tailscaled.service
 [Service]
 Type=simple
 WorkingDirectory=/srv/merox-agent
-ExecStart=/root/.local/share/mise/installs/python/3.14.3/bin/python3 /srv/merox-agent/service.py
+ExecStart=/srv/merox-agent/.venv/bin/python3 /srv/merox-agent/service.py
 EnvironmentFile=/srv/merox-agent/.env
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=10
 

@@ -1,116 +1,159 @@
 # merox-agent
 
-Intelligent CLI agent for managing the merox.dev homelab infrastructure:
+Intelligent infrastructure agent for the merox.dev homelab:
 - **Oracle Cloud server** — Docker services, system health
 - **Kubernetes cluster** — Talos OS, FluxCD GitOps, Longhorn
-- **Website** — merox.dev source at github.com/meroxdotdev/merox
+- **Website** — merox.dev
 
-Built with the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) — uses your **Claude Code account**, no separate API key needed.
+Built with [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) — uses your Claude Code account, no separate API key needed.
 
-## Requirements
+Interfaces: Telegram bot (phone) + CLI client (laptop).
 
-- Python 3.11+
-- Node.js 18+ (for Claude Code CLI)
-- **Claude Code CLI** — authenticated with your account
-- **Tailscale** — required to reach the Oracle server and K8s cluster remotely
+---
 
-## Setup
+## Disaster recovery — rebuild from zero
+
+Use this if you lose the Oracle server or get a new laptop.
+
+### 1. New Oracle Cloud server
 
 ```bash
+# 1. Provision Ubuntu 22.04+ VM on Oracle Cloud (Free Tier works)
+#    Open port 8765 in the security list (or keep it Tailscale-only)
+
+# 2. Install Tailscale and connect to your network
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+# Note the Tailscale IP: tailscale ip -4
+
+# 3. Install Python 3.11+
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
+
+# 4. Install Node.js and Claude Code CLI
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm install -g @anthropic-ai/claude-code
+
+# 5. Authenticate Claude Code (follow the browser OAuth prompt)
+claude
+
+# 6. Clone the agent repo
+sudo git clone https://github.com/meroxdotdev/merox-agent /srv/merox-agent
+cd /srv/merox-agent
+
+# 7. Configure
+sudo cp .env.example .env
+sudo nano .env
+# Fill in: SERVER_TS_IP, INFRA_REPO, WEBSITE_REPO, TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID
+
+# 8. Install (creates virtualenv, systemd service, Claude permissions)
+sudo bash install.sh
+```
+
+**That's it.** The agent is running and the Telegram bot is active.
+
+Verify:
+```bash
+systemctl status merox-agent
+journalctl -u merox-agent -f
+```
+
+---
+
+### 2. New laptop (connect to existing server)
+
+```bash
+# 1. Install Tailscale and connect
+# 2. Install Python deps
+pip install httpx
+
+# 3. Clone repo (or just grab client.py)
 git clone https://github.com/meroxdotdev/merox-agent
 cd merox-agent
 
-# 1. Install Claude Code CLI (if not already installed)
-npm install -g @anthropic-ai/claude-code
-
-# 2. Authenticate once (follow the login prompts)
-claude
-
-# 3. Install deps + create /usr/local/bin/merox-agent launcher
-sudo bash install.sh
-
-# 4. Configure
-cp .env.example .env
-# edit .env — set SERVER_TS_IP, SERVER_NAME, etc. (no API key needed)
+# 4. Configure server URL
+echo "AGENT_SERVER_URL=http://<SERVER_TAILSCALE_IP>:8765" > .env
 
 # 5. Run
-merox-agent
+python3 client.py
 ```
+
+Or just use the Telegram bot — no setup needed on the laptop at all.
+
+---
+
+### 3. What lives where
+
+| What | Where | Backed up? |
+|------|-------|------------|
+| Agent code | GitHub (this repo) | ✅ |
+| Infra repo (k8s manifests) | GitHub (meroxdotdev/infrastructure) | ✅ |
+| Website repo | GitHub (meroxdotdev/merox) | ✅ |
+| Server `.env` (Telegram token, IPs) | Only on server | ⚠️ Save it somewhere safe |
+| Kubernetes secrets (SOPS) | Git-encrypted in infra repo | ✅ (need AGE key) |
+| AGE encryption key | `/srv/kubernetes/infrastructure/age.key` | ⚠️ Back this up — losing it = losing all secrets |
+
+**The one thing you must back up manually:** the AGE key at `age.key`. Everything else is in git.
+
+---
 
 ## Usage
 
+### Telegram (recommended for phone)
+Message `@meroxagentbot` — ask anything about your infra.
+- `/clear` — reset conversation
+
+### CLI (laptop)
 ```bash
-merox-agent                              # interactive chat (remembers context)
-merox-agent "what pods are failing?"     # one-shot question
-
-# In interactive mode:
-clear   # reset conversation history
-exit    # quit
+python3 client.py                        # interactive
+python3 client.py "what pods are down?"  # one-shot
 ```
 
-## Example questions
-
+### Examples
 ```
-# Cluster
 what is the status of the cluster?
-show me all pods that are not running
-what does the longhorn helmrelease look like?
-reconcile flux-system
-
-# Server
-what docker containers are running?
-show me the last 50 lines of traefik logs
+which pods are not running?
+show me traefik logs
 how much disk is left on the server?
-restart the netdata container
-
-# GitOps
 what changed in the infra repo recently?
-add a new app called 'myapp' to the default namespace
-commit and push the changes
+reconcile flux-system
+```
 
-# Website
-what's the last commit on the website repo?
+---
+
+## Architecture
+
+```
+Phone/Laptop
+    │
+    ├── Telegram bot ──────────────────────┐
+    └── client.py ─── HTTP (Tailscale) ───►│
+                                           │ service.py (FastAPI)
+                                           │   └── Claude Agent SDK
+                                           │         └── Claude Code CLI
+                                           │               └── Bash tool
+                                           │                     ├── kubectl
+                                           │                     ├── talosctl
+                                           │                     ├── flux
+                                           │                     └── docker
+                                    Oracle Cloud Server
 ```
 
 ## Project structure
 
 ```
 merox-agent/
-├── agent.py          # standalone local agent (uses Anthropic API directly)
-├── service.py        # HTTP server (uses Claude Agent SDK — no API key)
-├── client.py         # thin remote client (connects to service.py over Tailscale)
-├── config.py         # all configuration (env var overrides)
-├── prompt.py         # system prompt with infra context
+├── service.py          # HTTP server + Telegram bot
+├── client.py           # CLI client (laptop)
+├── agent.py            # standalone agent (needs ANTHROPIC_API_KEY)
+├── config.py           # configuration from env vars
+├── prompt.py           # system prompt with infra context
 ├── tools/
-│   ├── kubernetes.py # kubectl, flux, talosctl (used by agent.py)
-│   ├── server.py     # docker, systemctl, shell (used by agent.py)
-│   └── git_tools.py  # git status, diff, commit, push (used by agent.py)
-├── install.sh        # setup script
+│   ├── kubernetes.py   # kubectl, flux, talosctl (used by agent.py)
+│   ├── server.py       # docker, systemctl, shell (used by agent.py)
+│   └── git_tools.py    # git operations (used by agent.py)
+├── install.sh          # server setup script
+├── merox-agent.service # systemd unit (generated by install.sh)
 ├── requirements.txt
-├── .env.example
-└── .gitignore
+└── .env.example
 ```
-
-## Two modes
-
-| Mode | File | Auth | Use case |
-|------|------|------|----------|
-| Local agent | `agent.py` | `ANTHROPIC_API_KEY` | Direct SSH access to server |
-| HTTP service | `service.py` | Claude Code CLI login | Remote via Tailscale from any device |
-
-The **HTTP service** (`service.py`) is the recommended mode — run it once on the Oracle server and connect from any device via `client.py`.
-
-## Security
-
-- Sensitive files are blocked: `*.sops.yaml`, `age.key`, `kubeconfig`, `talosconfig`, private keys
-- Destructive operations require confirmation
-- The agent never commits secrets or exposes credentials in responses
-
-## Tailscale note
-
-The service runs on the Oracle Cloud server. To connect from another device:
-1. Connect your device to Tailscale
-2. `pip install httpx && python3 client.py`
-
-The cluster nodes are also on the Tailscale network, so all `kubectl`/`flux`/`talosctl`
-commands work transparently once connected.
