@@ -144,6 +144,7 @@ async def _tg_send(bot, chat_id: int, text: str):
 
 
 async def start_telegram_bot():
+    import traceback
     from telegram import Update
     from telegram.constants import ChatAction
     from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -191,22 +192,38 @@ async def start_telegram_bot():
         for i in range(0, max(len(reply), 1), 4096):
             await _tg_send(context.bot, chat_id, reply[i:i + 4096])
 
-    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("clear", cmd_clear))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    retry_delay = 5
+    while True:
+        tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+        tg_app.add_handler(CommandHandler("start", cmd_start))
+        tg_app.add_handler(CommandHandler("clear", cmd_clear))
+        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling(drop_pending_updates=True)
-    print("Telegram bot polling started.")
-
-    try:
-        await asyncio.Event().wait()  # run forever
-    finally:
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
+        try:
+            await tg_app.initialize()
+            await tg_app.start()
+            await tg_app.updater.start_polling(drop_pending_updates=True)
+            print("Telegram bot polling started.", flush=True)
+            retry_delay = 5  # reset on success
+            await asyncio.Event().wait()  # run forever
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print(f"Telegram bot error (retrying in {retry_delay}s):\n{traceback.format_exc()}", flush=True)
+            try:
+                await tg_app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await tg_app.stop()
+            except Exception:
+                pass
+            try:
+                await tg_app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 120)  # exponential backoff, max 2 min
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
