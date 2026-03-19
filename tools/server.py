@@ -1,4 +1,5 @@
 """Oracle server management tools (runs locally on the server)."""
+import re
 from tools.shell import run
 
 # Sensitive paths that must never be read/written
@@ -109,10 +110,16 @@ DEFINITIONS = [
 ]
 
 _DANGEROUS = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd", ":(){ :|:& };:"]
+_SAFE_NAME = re.compile(r'^[a-zA-Z0-9_.\-]+$')  # safe container/service names
 
 
 def _is_blocked(path: str) -> bool:
     return any(b in path for b in _BLOCKED)
+
+
+def _safe_name(value: str, label: str) -> str | None:
+    """Return value if safe, else None."""
+    return value if _SAFE_NAME.match(value) else None
 
 
 def handle(name: str, inp: dict) -> str:
@@ -129,12 +136,17 @@ def handle(name: str, inp: dict) -> str:
         f = inp.get("filter", "")
         cmd = f"docker ps --format '{fmt}'"
         if f:
-            cmd += f" | grep -i '{f}'"
+            if not _SAFE_NAME.match(f):
+                return "Error: invalid filter — only alphanumeric, dash, underscore, dot allowed"
+            cmd += f" | grep -i {re.escape(f)}"
         return run(cmd)
 
     elif name == "docker_logs":
         container = inp["container"]
+        if not _safe_name(container, "container"):
+            return "Error: invalid container name"
         lines = inp.get("lines", 50)
+        lines = max(1, min(int(lines), 500))  # clamp 1-500
         return run(f"docker logs --tail {lines} {container} 2>&1")
 
     elif name == "docker_compose":
@@ -149,6 +161,8 @@ def handle(name: str, inp: dict) -> str:
             return run("systemctl list-units --type=service --state=running --no-pager | head -40")
         if not service:
             return "Error: 'service' is required for actions other than 'list'"
+        if not _safe_name(service, "service"):
+            return "Error: invalid service name"
         if action in ("start", "stop", "restart"):
             return run(f"systemctl {action} {service}")
         return run(f"systemctl status {service} --no-pager")

@@ -14,6 +14,7 @@ Start:
 import asyncio
 import json
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -44,14 +45,40 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 
 # ── Session store ─────────────────────────────────────────────────────────────
-# Maps our session_id → Claude CLI session_id (for resumption)
-_sessions: dict[str, str] = {}
+# Maps our session_id → (claude_cli_session_id, last_used_timestamp)
+_SESSION_TTL = 24 * 3600  # 24 hours
+_sessions: dict[str, tuple[str, float]] = {}
+
+
+def _get_session(key: str) -> str | None:
+    entry = _sessions.get(key)
+    if entry is None:
+        return None
+    session_id, _ = entry
+    _sessions[key] = (session_id, time.time())  # refresh on access
+    return session_id
+
+
+def _set_session(key: str, claude_session_id: str):
+    _sessions[key] = (claude_session_id, time.time())
+
+
+async def _cleanup_sessions():
+    """Remove sessions unused for longer than SESSION_TTL. Runs hourly."""
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = time.time() - _SESSION_TTL
+        stale = [k for k, (_, ts) in _sessions.items() if ts < cutoff]
+        for k in stale:
+            del _sessions[k]
+        if stale:
+            print(f"Session cleanup: removed {len(stale)} stale sessions.", flush=True)
 
 # ── Shared agent runner ───────────────────────────────────────────────────────
 
 async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None]:
     """Run the agent and yield event dicts (type, content/name/input)."""
-    claude_session_id = _sessions.get(session_key)
+    claude_session_id = _get_session(session_key)
 
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
@@ -92,7 +119,7 @@ async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None
         yield {"type": "error", "content": f"{type(e).__name__}: {e}"}
 
     if captured_session:
-        _sessions[session_key] = captured_session
+        _set_session(session_key, captured_session)
 
 
 # ── Telegram bot ──────────────────────────────────────────────────────────────
@@ -136,7 +163,7 @@ async def start_telegram_bot():
             return
         key = f"tg_{update.effective_user.id}"
         _sessions.pop(key, None)
-        await update.message.reply_text("🗑 Session cleared.")
+        await update.message.reply_text("Session cleared.")
 
     async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await _only_me(update):
@@ -186,13 +213,15 @@ async def start_telegram_bot():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(_cleanup_sessions())
     if TELEGRAM_TOKEN and TELEGRAM_USER_ID:
         tg_task = asyncio.create_task(start_telegram_bot())
-        print(f"Telegram bot enabled for user {TELEGRAM_USER_ID}.")
+        print(f"Telegram bot enabled for user {TELEGRAM_USER_ID}.", flush=True)
     else:
         tg_task = None
-        print("Telegram bot disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_USER_ID not set).")
+        print("Telegram bot disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_USER_ID not set).", flush=True)
     yield
+    cleanup_task.cancel()
     if tg_task:
         tg_task.cancel()
 
@@ -219,7 +248,8 @@ def health():
 
 @app.get("/sessions")
 def list_sessions():
-    return [{"session_id": sid} for sid in _sessions]
+    return [{"session_id": sid, "idle_seconds": int(time.time() - ts)}
+            for sid, (_, ts) in _sessions.items()]
 
 
 @app.delete("/sessions/{session_id}")

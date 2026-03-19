@@ -1,4 +1,5 @@
 """Git operations for infra and website repos."""
+import shlex
 from tools.shell import run
 
 DEFINITIONS = [
@@ -65,11 +66,11 @@ def handle(name: str, inp: dict) -> str:
         return run(f"git log --oneline -{n}", cwd=repo)
 
     elif name == "git_commit_push":
-        msg = inp["message"].replace('"', '\\"')
+        full_msg = inp["message"] + "\n\nCo-Authored-By: Merox Agent <agent@merox.dev>"
         results = []
         for cmd in [
             "git add -A",
-            f'git commit -m "{msg}\n\nCo-Authored-By: Merox Agent <agent@merox.dev>"',
+            f"git commit -m {shlex.quote(full_msg)}",
             "git push",
         ]:
             out = run(cmd, cwd=repo)
