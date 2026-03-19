@@ -110,8 +110,11 @@ async def chat(req: ChatRequest):
                             yield f"data: {json.dumps({'type': 'tool', 'name': block.name, 'input': block.input})}\n\n"
 
                 elif isinstance(message, ResultMessage):
-                    # Fallback: some SDK versions only emit ResultMessage
-                    if message.result and not full_text:
+                    if getattr(message, "is_error", False):
+                        err_text = message.result or "Agent returned an error"
+                        yield f"data: {json.dumps({'type': 'error', 'content': err_text})}\n\n"
+                    elif message.result and not full_text:
+                        # Fallback: some SDK versions only emit ResultMessage
                         full_text = message.result
                         yield f"data: {json.dumps({'type': 'text', 'content': message.result})}\n\n"
 
@@ -120,7 +123,7 @@ async def chat(req: ChatRequest):
         except CLIConnectionError as e:
             yield f"data: {json.dumps({'type': 'error', 'content': f'CLI connection error: {e}'})}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'content': f'{type(e).__name__}: {e}'})}\n\n"
 
         if captured_claude_session:
             _sessions[session_id] = captured_claude_session

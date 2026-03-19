@@ -115,7 +115,11 @@ def send_message(message: str, session_id: str) -> str:
                 print(f"{DIM}  [{name}({preview})]{RESET}")
 
             elif t == "text":
-                buffer = event["content"]
+                buffer += event["content"]
+
+            elif t == "error":
+                buffer = f"[Error] {event.get('content', 'unknown error')}"
+                break
 
             elif t == "done":
                 break
