@@ -4,7 +4,7 @@
 # Usage:
 #   git clone https://github.com/meroxdotdev/merox-agent /srv/merox-agent
 #   cd /srv/merox-agent
-#   cp .env.example .env && nano .env   # fill in ANTHROPIC_API_KEY + your values
+#   cp .env.example .env && nano .env
 #   sudo bash install.sh
 #
 set -euo pipefail
@@ -26,24 +26,41 @@ if [[ ! -f "$AGENT_DIR/.env" ]]; then
     exit 1
 fi
 
-if ! grep -q "ANTHROPIC_API_KEY=sk-ant-" "$AGENT_DIR/.env" 2>/dev/null; then
-    echo "ERROR: ANTHROPIC_API_KEY not set in .env"
-    echo "  Get your key at: https://console.anthropic.com/"
-    exit 1
+# ── Node.js + Claude Code CLI ─────────────────────────────────────────────────
+
+if ! command -v node &>/dev/null; then
+    echo "==> Installing Node.js 20..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
 fi
+
+if ! command -v claude &>/dev/null; then
+    echo "==> Installing Claude Code CLI..."
+    npm install -g @anthropic-ai/claude-code
+fi
+
+echo "==> Configuring Claude Code tool permissions..."
+mkdir -p "$AGENT_DIR/.claude"
+cat > "$AGENT_DIR/.claude/settings.json" << 'EOF'
+{
+  "permissions": {
+    "allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)"],
+    "deny": []
+  }
+}
+EOF
 
 # ── Python virtualenv ─────────────────────────────────────────────────────────
 
-echo "==> Creating Python virtualenv at $VENV ..."
+echo "==> Creating Python virtualenv..."
 python3 -m venv "$VENV"
 "$PYTHON" -m pip install --upgrade pip --quiet
 "$PYTHON" -m pip install -r "$AGENT_DIR/requirements.txt" --quiet
-"$PYTHON" -c "import anthropic, fastapi, uvicorn, telegram; print('All packages OK')"
+"$PYTHON" -c "import claude_agent_sdk, fastapi, uvicorn, telegram; print('All packages OK')"
 
 # ── systemd service ───────────────────────────────────────────────────────────
 
-echo "==> Installing systemd service ..."
-
+echo "==> Installing systemd service..."
 cat > /etc/systemd/system/merox-agent.service << EOF
 [Unit]
 Description=Merox Infrastructure Agent
@@ -74,11 +91,12 @@ systemctl restart merox-agent
 echo ""
 echo "Done! Service is running."
 echo ""
-echo "Check logs:     journalctl -u merox-agent -f"
-echo "Check status:   systemctl status merox-agent"
+echo "NOTE: Authenticate Claude Code if you haven't already:"
+echo "  claude login"
 echo ""
-echo "─── On your laptop / phone ──────────────────────────────────────────────"
-echo "  1. Connect Tailscale"
-echo "  2. pip install httpx"
-echo "  3. python3 client.py  (set AGENT_SERVER_URL in .env first)"
+echo "Check logs:   journalctl -u merox-agent -f"
+echo "Check status: systemctl status merox-agent"
+echo ""
+echo "─── On your laptop ──────────────────────────────────────────────────────"
+echo "  pip install httpx && python3 client.py"
 echo "  Or just message your Telegram bot."

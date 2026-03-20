@@ -2,13 +2,15 @@
 """
 Merox Agent — HTTP service + Telegram bot.
 
-Uses the Anthropic Python SDK directly.
-- Sessions = full conversation history, persisted to disk across restarts
+Uses the Claude Agent SDK (backed by Claude Code — included in Claude Pro/Team).
+No separate API key or per-token billing needed.
+
+- Sessions persisted to disk, survive restarts
 - Telegram streams responses live (message edited as chunks arrive)
 - Per-user lock prevents overlapping requests
 
 Requirements:
-    pip install anthropic fastapi uvicorn python-telegram-bot
+    pip install claude-agent-sdk fastapi uvicorn python-telegram-bot
 
 Start:
     python3 service.py
@@ -22,15 +24,25 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
 
-import anthropic
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from config import MODEL, MAX_TOKENS
+from claude_agent_sdk import (
+    query,
+    ClaudeAgentOptions,
+    ResultMessage,
+    AssistantMessage,
+    TextBlock,
+    ToolUseBlock,
+    SystemMessage,
+    CLINotFoundError,
+    CLIConnectionError,
+)
+
+from config import MODEL
 from prompt import build_system_prompt
-from tools import DEFINITIONS as TOOLS, run_bash
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -38,35 +50,43 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 
 _TG_EDIT_INTERVAL = 1.2   # seconds between live edits (Telegram: max 1 edit/sec)
-_MAX_HISTORY      = 40    # max messages kept per session (20 turns)
 
 # ── Session store ─────────────────────────────────────────────────────────────
-# Maps session_key → list of Anthropic message dicts (full conversation history)
+# Maps session_key → (claude_cli_session_id, last_used_timestamp)
 
+_SESSION_TTL  = 24 * 3600  # 24 hours
 _SESSION_FILE = Path(__file__).parent / "memory" / "sessions.json"
-_sessions: dict[str, list] = {}
+_sessions: dict[str, tuple[str, float]] = {}
 
 
 def _load_sessions_from_disk() -> None:
     try:
-        _sessions.update(json.loads(_SESSION_FILE.read_text()))
-    except (FileNotFoundError, json.JSONDecodeError):
+        data = json.loads(_SESSION_FILE.read_text())
+        for k, v in data.items():
+            _sessions[k] = (v["session_id"], v["ts"])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
         pass
 
 
 def _save_sessions_to_disk() -> None:
+    data = {k: {"session_id": sid, "ts": ts} for k, (sid, ts) in _sessions.items()}
     try:
-        _SESSION_FILE.write_text(json.dumps(_sessions))
+        _SESSION_FILE.write_text(json.dumps(data))
     except Exception as e:
         print(f"Session save error: {e}", flush=True)
 
 
-def _get_conversation(key: str) -> list:
-    return list(_sessions.get(key, []))
+def _get_session(key: str) -> str | None:
+    entry = _sessions.get(key)
+    if entry is None:
+        return None
+    session_id, _ = entry
+    _sessions[key] = (session_id, time.time())
+    return session_id
 
 
-def _set_conversation(key: str, conversation: list) -> None:
-    _sessions[key] = conversation[-_MAX_HISTORY:]
+def _set_session(key: str, claude_session_id: str) -> None:
+    _sessions[key] = (claude_session_id, time.time())
     _save_sessions_to_disk()
 
 
@@ -75,73 +95,65 @@ def _clear_session(key: str) -> None:
     _save_sessions_to_disk()
 
 
+async def _cleanup_sessions() -> None:
+    """Remove sessions unused for longer than SESSION_TTL. Runs hourly."""
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = time.time() - _SESSION_TTL
+        stale = [k for k, (_, ts) in _sessions.items() if ts < cutoff]
+        for k in stale:
+            del _sessions[k]
+        if stale:
+            _save_sessions_to_disk()
+            print(f"Session cleanup: removed {len(stale)} stale sessions.", flush=True)
+
+
 # ── Agent runner ──────────────────────────────────────────────────────────────
 
-_client = anthropic.AsyncAnthropic()
-
-
 async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None]:
-    """
-    Run the agent loop for one user message.
-    Yields event dicts: {"type": "text"|"tool"|"error", ...}
-    Handles multi-turn tool use transparently.
-    """
-    conversation = _get_conversation(session_key)
-    conversation.append({"role": "user", "content": message})
+    """Run the agent and yield event dicts."""
+    claude_session_id = _get_session(session_key)
 
-    while True:
-        try:
-            async with _client.messages.stream(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=build_system_prompt(),
-                tools=TOOLS,
-                messages=conversation,
-            ) as stream:
-                # Stream text chunks in real time
-                async for text in stream.text_stream:
-                    yield {"type": "text", "content": text}
+    options = ClaudeAgentOptions(
+        system_prompt=build_system_prompt(),
+        allowed_tools=["Bash"],
+        permission_mode="default",
+        model=MODEL,
+        resume=claude_session_id,
+    )
 
-                final = await stream.get_final_message()
+    captured_session = None
+    full_text = ""
 
-        except anthropic.APIError as e:
-            yield {"type": "error", "content": f"API error: {e}"}
-            return
+    try:
+        async for msg in query(prompt=message, options=options):
+            if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                captured_session = msg.data.get("session_id")
 
-        # Build assistant message for conversation history
-        assistant_content = []
-        for block in final.content:
-            if block.type == "text":
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+            elif isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        full_text += block.text
+                        yield {"type": "text", "content": block.text}
+                    elif isinstance(block, ToolUseBlock):
+                        yield {"type": "tool", "name": block.name, "input": block.input}
 
-        conversation.append({"role": "assistant", "content": assistant_content})
+            elif isinstance(msg, ResultMessage):
+                if getattr(msg, "is_error", False):
+                    yield {"type": "error", "content": msg.result or "Agent returned an error"}
+                elif msg.result and not full_text:
+                    full_text = msg.result
+                    yield {"type": "text", "content": msg.result}
 
-        if final.stop_reason == "end_turn":
-            break
+    except CLINotFoundError:
+        yield {"type": "error", "content": "Claude CLI not found. Run: npm install -g @anthropic-ai/claude-code"}
+    except CLIConnectionError as e:
+        yield {"type": "error", "content": f"CLI connection error: {e}"}
+    except Exception as e:
+        yield {"type": "error", "content": f"{type(e).__name__}: {e}"}
 
-        if final.stop_reason == "tool_use":
-            tool_results = []
-            for block in final.content:
-                if block.type == "tool_use":
-                    yield {"type": "tool", "name": block.name, "input": block.input}
-                    result = run_bash(block.input.get("command", ""))
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-            conversation.append({"role": "user", "content": tool_results})
-        else:
-            break
-
-    _set_conversation(session_key, conversation)
+    if captured_session:
+        _set_session(session_key, captured_session)
 
 
 # ── Telegram bot ──────────────────────────────────────────────────────────────
@@ -205,7 +217,7 @@ async def start_telegram_bot() -> None:
             return
 
         async with _user_locks[key]:
-            # Placeholder message — edited live as chunks arrive
+            # Placeholder — edited live as chunks arrive
             sent = await context.bot.send_message(chat_id=chat_id, text="⏳")
             accumulated = ""
             last_edit = 0.0
@@ -226,7 +238,6 @@ async def start_telegram_bot() -> None:
             if not accumulated:
                 accumulated = "No response."
 
-            # Final edit: replace placeholder with complete response
             await _tg_edit(sent, accumulated[:4096])
             for i in range(4096, len(accumulated), 4096):
                 await _tg_send(context.bot, chat_id, accumulated[i:i + 4096])
@@ -263,6 +274,7 @@ async def start_telegram_bot() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_sessions_from_disk()
+    cleanup_task = asyncio.create_task(_cleanup_sessions())
     if TELEGRAM_TOKEN and TELEGRAM_USER_ID:
         tg_task = asyncio.create_task(start_telegram_bot())
         print(f"Telegram bot enabled for user {TELEGRAM_USER_ID}.", flush=True)
@@ -270,6 +282,7 @@ async def lifespan(app: FastAPI):
         tg_task = None
         print("Telegram bot disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_USER_ID).", flush=True)
     yield
+    cleanup_task.cancel()
     if tg_task:
         tg_task.cancel()
 
@@ -296,7 +309,8 @@ def health():
 
 @app.get("/sessions")
 def list_sessions():
-    return [{"session_id": k, "turns": len(v) // 2} for k, v in _sessions.items()]
+    return [{"session_id": sid, "idle_seconds": int(time.time() - ts)}
+            for sid, (_, ts) in _sessions.items()]
 
 
 @app.delete("/sessions/{session_id}")

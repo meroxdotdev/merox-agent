@@ -1,5 +1,5 @@
 # Server + agent (service.py, agent.py)
-anthropic>=0.50.0
+claude-agent-sdk>=0.0.1
 fastapi>=0.115.0
 uvicorn>=0.34.0
 pyyaml>=6.0
