@@ -2,30 +2,20 @@
 """
 Merox Agent — interactive CLI.
 
-Runs directly on the server (no Tailscale needed).
-Requires Claude Code CLI to be installed and authenticated.
+Runs directly on the server. Uses the Anthropic Python SDK.
 
 Usage:
     python3 agent.py                        # interactive chat
     python3 agent.py "what pods are down?"  # one-shot
 """
-import asyncio
+import os
 import sys
 
-from claude_agent_sdk import (
-    query,
-    ClaudeAgentOptions,
-    AssistantMessage,
-    TextBlock,
-    ToolUseBlock,
-    ResultMessage,
-    SystemMessage,
-    CLINotFoundError,
-    CLIConnectionError,
-)
+import anthropic
 
-from config import MODEL
+from config import MODEL, MAX_TOKENS
 from prompt import build_system_prompt
+from tools import DEFINITIONS as TOOLS, run_bash
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -35,77 +25,107 @@ BOLD  = "\033[1m"
 RED   = "\033[1;31m"
 RESET = "\033[0m"
 
-
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
-async def run_turn(prompt: str, session_id: str | None = None) -> tuple[str, str | None]:
-    """Run one turn, print tool calls live, return (response_text, session_id)."""
-    options = ClaudeAgentOptions(
-        system_prompt=build_system_prompt(),
-        allowed_tools=["Bash"],
-        permission_mode="default",
-        model=MODEL,
-        resume=session_id,
-    )
+_client = anthropic.Anthropic()
 
-    text = ""
-    captured_session = session_id
 
-    try:
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                captured_session = msg.data.get("session_id", session_id)
+def run_turn(conversation: list, user_msg: str) -> tuple[str, list]:
+    """
+    Send a user message and return (response_text, updated_conversation).
+    Handles multi-turn tool use. Streams text to stdout in real time.
+    """
+    conversation = conversation + [{"role": "user", "content": user_msg}]
 
-            elif isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        text += block.text
-                    elif isinstance(block, ToolUseBlock):
-                        preview = str(block.input)
-                        if len(preview) > 70:
-                            preview = preview[:67] + "..."
-                        print(f"{DIM}  [{block.name}({preview})]{RESET}")
+    while True:
+        text = ""
 
-            elif isinstance(msg, ResultMessage):
-                if getattr(msg, "is_error", False):
-                    text = f"Error: {msg.result}"
-                elif msg.result and not text:
-                    text = msg.result
+        with _client.messages.stream(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=build_system_prompt(),
+            tools=TOOLS,
+            messages=conversation,
+        ) as stream:
+            for chunk in stream.text_stream:
+                print(chunk, end="", flush=True)
+                text += chunk
 
-    except CLINotFoundError:
-        text = f"{RED}Claude CLI not found.{RESET} Run: npm install -g @anthropic-ai/claude-code"
-    except CLIConnectionError as e:
-        text = f"{RED}CLI connection error:{RESET} {e}"
+            final = stream.get_final_message()
 
-    return text or "No response.", captured_session
+        assistant_content = []
+        for block in final.content:
+            if block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+
+        conversation.append({"role": "assistant", "content": assistant_content})
+
+        if final.stop_reason == "end_turn":
+            print()  # newline after streamed text
+            return text, conversation
+
+        if final.stop_reason == "tool_use":
+            tool_results = []
+            for block in final.content:
+                if block.type == "tool_use":
+                    preview = str(block.input)
+                    if len(preview) > 70:
+                        preview = preview[:67] + "..."
+                    print(f"\n{DIM}  [{block.name}({preview})]{RESET}", end="", flush=True)
+                    result = run_bash(block.input.get("command", ""))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            conversation.append({"role": "user", "content": tool_results})
+        else:
+            print()
+            return text, conversation
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _check_env() -> None:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print(f"{RED}Error:{RESET} ANTHROPIC_API_KEY is not set.")
+        print("  export ANTHROPIC_API_KEY='sk-ant-...'")
+        sys.exit(1)
+
 
 def _banner() -> None:
     print(f"{CYAN}╔══════════════════════════════════════╗")
     print(f"║     Merox Infrastructure Agent       ║")
     print(f"╚══════════════════════════════════════╝{RESET}")
-    print("Type 'exit' to quit, 'clear' to reset session.\n")
+    print("Type 'exit' to quit, 'clear' to reset conversation.\n")
 
 
 def main() -> None:
-    session_id: str | None = None
+    _check_env()
 
     # One-shot mode
     if len(sys.argv) > 1:
         question = " ".join(sys.argv[1:])
         print(f"{BOLD}You:{RESET} {question}")
-        text, _ = asyncio.run(run_turn(question))
-        print(f"\n{CYAN}Agent:{RESET} {text}\n")
+        print(f"\n{CYAN}Agent:{RESET} ", end="")
+        run_turn([], question)
+        print()
         return
 
     # Interactive mode
     _banner()
+    conversation: list = []
 
     while True:
         try:
-            user_input = input(f"{BOLD}You:{RESET} ").strip()
+            user_input = input(f"\n{BOLD}You:{RESET} ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye!")
             break
@@ -116,15 +136,17 @@ def main() -> None:
             print("Goodbye!")
             break
         if user_input.lower() == "clear":
-            session_id = None
-            print("Session cleared.\n")
+            conversation = []
+            print("Conversation cleared.")
             continue
 
         try:
-            text, session_id = asyncio.run(run_turn(user_input, session_id))
-            print(f"\n{CYAN}Agent:{RESET} {text}\n")
+            print(f"\n{CYAN}Agent:{RESET} ", end="")
+            _, conversation = run_turn(conversation, user_input)
+        except anthropic.APIError as e:
+            print(f"\n{RED}API Error:{RESET} {e}")
         except KeyboardInterrupt:
-            print("\n(interrupted)\n")
+            print("\n(interrupted)")
 
 
 if __name__ == "__main__":

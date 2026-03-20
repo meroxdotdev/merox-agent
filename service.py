@@ -2,11 +2,13 @@
 """
 Merox Agent — HTTP service + Telegram bot.
 
-Runs on the Oracle server. The HTTP endpoint serves client.py (SSE streaming).
-The Telegram bot allows chatting with the agent directly from your phone.
+Uses the Anthropic Python SDK directly.
+- Sessions = full conversation history, persisted to disk across restarts
+- Telegram streams responses live (message edited as chunks arrive)
+- Per-user lock prevents overlapping requests
 
 Requirements:
-    pip install claude-agent-sdk fastapi uvicorn python-telegram-bot
+    pip install anthropic fastapi uvicorn python-telegram-bot
 
 Start:
     python3 service.py
@@ -17,180 +19,217 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
+import anthropic
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from claude_agent_sdk import (
-    query,
-    ClaudeAgentOptions,
-    ResultMessage,
-    AssistantMessage,
-    TextBlock,
-    ToolUseBlock,
-    SystemMessage,
-    CLINotFoundError,
-    CLIConnectionError,
-)
-
-from config import MODEL
+from config import MODEL, MAX_TOKENS
 from prompt import build_system_prompt
+from tools import DEFINITIONS as TOOLS, run_bash
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 
+_TG_EDIT_INTERVAL = 1.2   # seconds between live edits (Telegram: max 1 edit/sec)
+_MAX_HISTORY      = 40    # max messages kept per session (20 turns)
+
 # ── Session store ─────────────────────────────────────────────────────────────
-# Maps our session_id → (claude_cli_session_id, last_used_timestamp)
-_SESSION_TTL = 24 * 3600  # 24 hours
-_sessions: dict[str, tuple[str, float]] = {}
+# Maps session_key → list of Anthropic message dicts (full conversation history)
+
+_SESSION_FILE = Path(__file__).parent / "memory" / "sessions.json"
+_sessions: dict[str, list] = {}
 
 
-def _get_session(key: str) -> str | None:
-    entry = _sessions.get(key)
-    if entry is None:
-        return None
-    session_id, _ = entry
-    _sessions[key] = (session_id, time.time())  # refresh on access
-    return session_id
+def _load_sessions_from_disk() -> None:
+    try:
+        _sessions.update(json.loads(_SESSION_FILE.read_text()))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
 
-def _set_session(key: str, claude_session_id: str):
-    _sessions[key] = (claude_session_id, time.time())
+def _save_sessions_to_disk() -> None:
+    try:
+        _SESSION_FILE.write_text(json.dumps(_sessions))
+    except Exception as e:
+        print(f"Session save error: {e}", flush=True)
 
 
-async def _cleanup_sessions():
-    """Remove sessions unused for longer than SESSION_TTL. Runs hourly."""
-    while True:
-        await asyncio.sleep(3600)
-        cutoff = time.time() - _SESSION_TTL
-        stale = [k for k, (_, ts) in _sessions.items() if ts < cutoff]
-        for k in stale:
-            del _sessions[k]
-        if stale:
-            print(f"Session cleanup: removed {len(stale)} stale sessions.", flush=True)
+def _get_conversation(key: str) -> list:
+    return list(_sessions.get(key, []))
 
-# ── Shared agent runner ───────────────────────────────────────────────────────
+
+def _set_conversation(key: str, conversation: list) -> None:
+    _sessions[key] = conversation[-_MAX_HISTORY:]
+    _save_sessions_to_disk()
+
+
+def _clear_session(key: str) -> None:
+    _sessions.pop(key, None)
+    _save_sessions_to_disk()
+
+
+# ── Agent runner ──────────────────────────────────────────────────────────────
+
+_client = anthropic.AsyncAnthropic()
+
 
 async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None]:
-    """Run the agent and yield event dicts (type, content/name/input)."""
-    claude_session_id = _get_session(session_key)
+    """
+    Run the agent loop for one user message.
+    Yields event dicts: {"type": "text"|"tool"|"error", ...}
+    Handles multi-turn tool use transparently.
+    """
+    conversation = _get_conversation(session_key)
+    conversation.append({"role": "user", "content": message})
 
-    options = ClaudeAgentOptions(
-        system_prompt=build_system_prompt(),
-        allowed_tools=["Bash"],
-        permission_mode="default",
-        model=MODEL,
-        resume=claude_session_id,
-    )
+    while True:
+        try:
+            async with _client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=build_system_prompt(),
+                tools=TOOLS,
+                messages=conversation,
+            ) as stream:
+                # Stream text chunks in real time
+                async for text in stream.text_stream:
+                    yield {"type": "text", "content": text}
 
-    captured_session = None
-    full_text = ""
+                final = await stream.get_final_message()
 
-    try:
-        async for msg in query(prompt=message, options=options):
-            if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                captured_session = msg.data.get("session_id")
+        except anthropic.APIError as e:
+            yield {"type": "error", "content": f"API error: {e}"}
+            return
 
-            elif isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        full_text += block.text
-                        yield {"type": "text", "content": block.text}
-                    elif isinstance(block, ToolUseBlock):
-                        yield {"type": "tool", "name": block.name, "input": block.input}
+        # Build assistant message for conversation history
+        assistant_content = []
+        for block in final.content:
+            if block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
 
-            elif isinstance(msg, ResultMessage):
-                if getattr(msg, "is_error", False):
-                    yield {"type": "error", "content": msg.result or "Agent returned an error"}
-                elif msg.result and not full_text:
-                    full_text = msg.result
-                    yield {"type": "text", "content": msg.result}
+        conversation.append({"role": "assistant", "content": assistant_content})
 
-    except CLINotFoundError:
-        yield {"type": "error", "content": "Claude CLI not found. Run: npm install -g @anthropic-ai/claude-code"}
-    except CLIConnectionError as e:
-        yield {"type": "error", "content": f"CLI connection error: {e}"}
-    except Exception as e:
-        yield {"type": "error", "content": f"{type(e).__name__}: {e}"}
+        if final.stop_reason == "end_turn":
+            break
 
-    if captured_session:
-        _set_session(session_key, captured_session)
+        if final.stop_reason == "tool_use":
+            tool_results = []
+            for block in final.content:
+                if block.type == "tool_use":
+                    yield {"type": "tool", "name": block.name, "input": block.input}
+                    result = run_bash(block.input.get("command", ""))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            conversation.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    _set_conversation(session_key, conversation)
 
 
 # ── Telegram bot ──────────────────────────────────────────────────────────────
 
-async def _tg_agent_reply(user_message: str, session_key: str) -> str:
-    """Collect full agent response for Telegram (non-streaming)."""
-    parts = []
-    async for event in run_agent(user_message, session_key):
-        if event["type"] == "text":
-            parts.append(event["content"])
-        elif event["type"] == "error":
-            parts.append(f"❌ {event['content']}")
-    return "".join(parts) or "No response."
+async def _tg_edit(message, text: str) -> None:
+    """Edit a Telegram message, Markdown first then plain fallback."""
+    try:
+        await message.edit_text(text, parse_mode="Markdown")
+    except Exception:
+        try:
+            await message.edit_text(text)
+        except Exception:
+            pass
 
 
-async def _tg_send(bot, chat_id: int, text: str):
-    """Send message, try Markdown first, fall back to plain text."""
+async def _tg_send(bot, chat_id: int, text: str) -> None:
+    """Send a new Telegram message, Markdown first then plain fallback."""
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception:
         await bot.send_message(chat_id=chat_id, text=text)
 
 
-async def start_telegram_bot():
+async def start_telegram_bot() -> None:
     import traceback
     from telegram import Update
-    from telegram.constants import ChatAction
     from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+    _user_locks: dict[str, asyncio.Lock] = {}
 
     async def _only_me(update: Update) -> bool:
         return update.effective_user and update.effective_user.id == TELEGRAM_USER_ID
 
-    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await _only_me(update):
             return
         await update.message.reply_text(
-            "👋 Merox Agent ready.\n\nAsk me anything about your infra — cluster, pods, services, logs.\n\n/clear — reset conversation"
+            "👋 Merox Agent ready.\n\n"
+            "Ask me anything about your infra — cluster, pods, services, logs.\n\n"
+            "/clear — reset conversation"
         )
 
-    async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await _only_me(update):
             return
-        key = f"tg_{update.effective_user.id}"
-        _sessions.pop(key, None)
+        _clear_session(f"tg_{update.effective_user.id}")
         await update.message.reply_text("Session cleared.")
 
-    async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await _only_me(update):
             return
 
         key = f"tg_{update.effective_user.id}"
         chat_id = update.effective_chat.id
 
-        # Keep typing indicator alive while agent runs
-        stop_typing = asyncio.Event()
+        # One request at a time per user
+        if key not in _user_locks:
+            _user_locks[key] = asyncio.Lock()
+        if _user_locks[key].locked():
+            await update.message.reply_text("⏳ Still processing your previous message...")
+            return
 
-        async def typing_loop():
-            while not stop_typing.is_set():
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                await asyncio.sleep(4)
+        async with _user_locks[key]:
+            # Placeholder message — edited live as chunks arrive
+            sent = await context.bot.send_message(chat_id=chat_id, text="⏳")
+            accumulated = ""
+            last_edit = 0.0
 
-        typing_task = asyncio.create_task(typing_loop())
-        try:
-            reply = await _tg_agent_reply(update.message.text, key)
-        finally:
-            stop_typing.set()
-            typing_task.cancel()
+            async for event in run_agent(update.message.text, key):
+                if event["type"] == "text":
+                    accumulated += event["content"]
+                    now = time.time()
+                    if now - last_edit >= _TG_EDIT_INTERVAL and len(accumulated) <= 4096:
+                        try:
+                            await sent.edit_text(accumulated + " ▌")
+                            last_edit = now
+                        except Exception:
+                            pass
+                elif event["type"] == "error":
+                    accumulated = f"❌ {event['content']}"
 
-        # Split if over Telegram's 4096 char limit
-        for i in range(0, max(len(reply), 1), 4096):
-            await _tg_send(context.bot, chat_id, reply[i:i + 4096])
+            if not accumulated:
+                accumulated = "No response."
+
+            # Final edit: replace placeholder with complete response
+            await _tg_edit(sent, accumulated[:4096])
+            for i in range(4096, len(accumulated), 4096):
+                await _tg_send(context.bot, chat_id, accumulated[i:i + 4096])
 
     retry_delay = 5
     while True:
@@ -204,41 +243,33 @@ async def start_telegram_bot():
             await tg_app.start()
             await tg_app.updater.start_polling(drop_pending_updates=True)
             print("Telegram bot polling started.", flush=True)
-            retry_delay = 5  # reset on success
-            await asyncio.Event().wait()  # run forever
+            retry_delay = 5
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             raise
         except Exception:
             print(f"Telegram bot error (retrying in {retry_delay}s):\n{traceback.format_exc()}", flush=True)
-            try:
-                await tg_app.updater.stop()
-            except Exception:
-                pass
-            try:
-                await tg_app.stop()
-            except Exception:
-                pass
-            try:
-                await tg_app.shutdown()
-            except Exception:
-                pass
+            for method in (tg_app.updater.stop, tg_app.stop, tg_app.shutdown):
+                try:
+                    await method()
+                except Exception:
+                    pass
             await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 120)  # exponential backoff, max 2 min
+            retry_delay = min(retry_delay * 2, 120)
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_task = asyncio.create_task(_cleanup_sessions())
+    _load_sessions_from_disk()
     if TELEGRAM_TOKEN and TELEGRAM_USER_ID:
         tg_task = asyncio.create_task(start_telegram_bot())
         print(f"Telegram bot enabled for user {TELEGRAM_USER_ID}.", flush=True)
     else:
         tg_task = None
-        print("Telegram bot disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_USER_ID not set).", flush=True)
+        print("Telegram bot disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_USER_ID).", flush=True)
     yield
-    cleanup_task.cancel()
     if tg_task:
         tg_task.cancel()
 
@@ -265,13 +296,12 @@ def health():
 
 @app.get("/sessions")
 def list_sessions():
-    return [{"session_id": sid, "idle_seconds": int(time.time() - ts)}
-            for sid, (_, ts) in _sessions.items()]
+    return [{"session_id": k, "turns": len(v) // 2} for k, v in _sessions.items()]
 
 
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
-    _sessions.pop(session_id, None)
+    _clear_session(session_id)
     return {"cleared": session_id}
 
 

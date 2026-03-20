@@ -1,11 +1,10 @@
 #!/bin/bash
 # Merox Agent — server install script
-# Run on the Oracle Cloud server after cloning the repo.
 #
 # Usage:
 #   git clone https://github.com/meroxdotdev/merox-agent /srv/merox-agent
 #   cd /srv/merox-agent
-#   cp .env.example .env && nano .env   # fill in your values
+#   cp .env.example .env && nano .env   # fill in ANTHROPIC_API_KEY + your values
 #   sudo bash install.sh
 #
 set -euo pipefail
@@ -27,37 +26,24 @@ if [[ ! -f "$AGENT_DIR/.env" ]]; then
     exit 1
 fi
 
+if ! grep -q "ANTHROPIC_API_KEY=sk-ant-" "$AGENT_DIR/.env" 2>/dev/null; then
+    echo "ERROR: ANTHROPIC_API_KEY not set in .env"
+    echo "  Get your key at: https://console.anthropic.com/"
+    exit 1
+fi
+
 # ── Python virtualenv ─────────────────────────────────────────────────────────
 
 echo "==> Creating Python virtualenv at $VENV ..."
 python3 -m venv "$VENV"
 "$PYTHON" -m pip install --upgrade pip --quiet
-"$PYTHON" -m pip install -r "$AGENT_DIR/requirements.txt"
-"$PYTHON" -c "import claude_agent_sdk, fastapi, uvicorn, telegram; print('All packages OK')"
-
-# ── Claude Code permissions ───────────────────────────────────────────────────
-
-echo "==> Configuring Claude Code tool permissions ..."
-mkdir -p "$AGENT_DIR/.claude"
-cat > "$AGENT_DIR/.claude/settings.json" << 'EOF'
-{
-  "permissions": {
-    "allow": [
-      "Bash(*)",
-      "Read(*)",
-      "Write(*)",
-      "Edit(*)"
-    ],
-    "deny": []
-  }
-}
-EOF
+"$PYTHON" -m pip install -r "$AGENT_DIR/requirements.txt" --quiet
+"$PYTHON" -c "import anthropic, fastapi, uvicorn, telegram; print('All packages OK')"
 
 # ── systemd service ───────────────────────────────────────────────────────────
 
 echo "==> Installing systemd service ..."
 
-# Write the service file with the correct venv python path
 cat > /etc/systemd/system/merox-agent.service << EOF
 [Unit]
 Description=Merox Infrastructure Agent
@@ -72,6 +58,8 @@ EnvironmentFile=$AGENT_DIR/.env
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Install]
 WantedBy=multi-user.target
@@ -93,4 +81,4 @@ echo "─── On your laptop / phone ─────────────�
 echo "  1. Connect Tailscale"
 echo "  2. pip install httpx"
 echo "  3. python3 client.py  (set AGENT_SERVER_URL in .env first)"
-echo "  Or just message @meroxagentbot on Telegram."
+echo "  Or just message your Telegram bot."

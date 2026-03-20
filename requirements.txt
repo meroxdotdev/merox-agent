@@ -1,9 +1,9 @@
-# Server dependencies (service.py + agent.py)
-claude-agent-sdk>=0.0.1
+# Server + agent (service.py, agent.py)
+anthropic>=0.50.0
 fastapi>=0.115.0
 uvicorn>=0.34.0
 pyyaml>=6.0
 python-telegram-bot>=21.0
 
-# Client dependency (client.py — install on your laptop)
+# Client (client.py — install on your laptop)
 httpx>=0.28.0

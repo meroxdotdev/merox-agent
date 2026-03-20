@@ -14,3 +14,6 @@ memory/archive/
 
 # kubectl cache
 .kube/
+
+# Session persistence (contains claude session IDs, not secrets but no reason to commit)
+memory/sessions.json
