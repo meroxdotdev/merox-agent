@@ -1,0 +1,31 @@
+name: cert-renew
+description: Debug and fix certificate issues (cert-manager)
+trigger: "Certificate expired, not renewing, or TLS errors"
+steps:
+  - name: check_certs
+    description: "List all certificates and their status"
+    command: "kubectl get certificates -A"
+    details: "kubectl get certificaterequests -A"
+
+  - name: check_issuer
+    description: "Verify ClusterIssuer/Issuer is ready"
+    command: "kubectl get clusterissuer,issuer -A"
+
+  - name: check_challenges
+    description: "Look for pending ACME challenges"
+    command: "kubectl get challenges -A"
+    describe: "kubectl describe challenge -A"
+
+  - name: force_renew
+    description: "Delete and recreate certificate to force renewal"
+    command: "kubectl -n {namespace} delete certificate {cert_name}"
+    note: "cert-manager will automatically recreate via the Ingress/Gateway annotation"
+    confirm_before: true
+
+  - name: verify
+    description: "Wait and verify new cert is issued"
+    command: "kubectl -n {namespace} get certificate {cert_name} -w --timeout=120s"
+
+  - name: report
+    log_event: "Certificate debug/renewal: {cert_name}"
+    tags: ["cert", "tls"]

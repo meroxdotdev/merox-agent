@@ -6,3 +6,11 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
+
+# Memory data (may contain sensitive output)
+memory/events.jsonl
+memory/notes.json
+memory/archive/
+
+# kubectl cache
+.kube/

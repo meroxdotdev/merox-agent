@@ -1,0 +1,32 @@
+name: disk-cleanup
+description: Free disk space on the Oracle Cloud server
+trigger: "Disk usage is high or user asks to clean up space"
+steps:
+  - name: assess
+    description: "Check current disk usage"
+    overview: "df -h / /srv"
+    largest_dirs: "du -sh /srv/* /var/log /tmp 2>/dev/null | sort -rh | head -15"
+    docker: "docker system df"
+
+  - name: safe_cleanup
+    description: "Non-destructive cleanup actions"
+    docker_prune: "docker system prune -f --volumes"
+    journal: "journalctl --vacuum-time=7d"
+    tmp: "find /tmp -type f -atime +7 -delete"
+    apt: "apt-get autoremove -y && apt-get clean"
+    confirm_before: true
+
+  - name: aggressive_cleanup
+    description: "More aggressive cleanup (requires explicit confirmation)"
+    docker_images: "docker image prune -a -f"
+    old_logs: "find /var/log -name '*.gz' -delete"
+    confirm_before: true
+    warn: "This will remove all unused Docker images"
+
+  - name: verify
+    description: "Verify space was freed"
+    command: "df -h / /srv"
+
+  - name: report
+    log_event: "Disk cleanup performed"
+    tags: ["maintenance", "disk"]

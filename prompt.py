@@ -1,7 +1,14 @@
-"""System prompt with full infrastructure context."""
+"""System prompt — static infrastructure description + runbooks.
+
+Dynamic state (cluster, containers, resources) is NOT injected here.
+The agent fetches it on demand via Bash tools when needed.
+"""
+from pathlib import Path
 from config import INFRA_REPO, WEBSITE_REPO, SERVER_NAME, SERVER_TS_IP, DOCKER_COMPOSE_DIR
 
-SYSTEM_PROMPT = f"""You are an intelligent infrastructure agent for merox.dev.
+_MEMORY_DIR = Path(__file__).parent / "memory"
+
+_BASE = f"""You are an intelligent infrastructure agent for merox.dev.
 You manage a personal homelab: an Oracle Cloud server, a Kubernetes cluster, and a website.
 
 ━━━ ORACLE CLOUD SERVER ({SERVER_NAME} / Tailscale: {SERVER_TS_IP}) ━━━
@@ -40,7 +47,36 @@ When running kubectl, talosctl, or flux commands, always prefix with the require
 3. Prefer GitOps (edit files → commit → push) over direct kubectl apply
 4. For systemctl stop/restart or docker compose down on critical services, always confirm
 5. Keep responses concise and actionable
+6. After significant actions, log them to memory
+7. When a task matches a runbook, follow the runbook steps
+
+━━━ MEMORY ━━━
+Persistent memory is stored in {_MEMORY_DIR}/.
+
+Read:
+  cat {_MEMORY_DIR}/notes.json
+  tail -50 {_MEMORY_DIR}/events.jsonl
+
+Write:
+  python3 {_MEMORY_DIR}/cli.py log "action description" ["result"] [tag1 tag2 ...]
+  python3 {_MEMORY_DIR}/cli.py note "key" "value"
+  python3 {_MEMORY_DIR}/cli.py note-delete "key"
 
 ━━━ TONE ━━━
-Respond in Romanian or English based on what the user uses. Be direct and technical.
-"""
+Respond in Romanian or English based on what the user uses. Be direct and technical."""
+
+
+def build_system_prompt() -> str:
+    parts = [_BASE]
+    try:
+        from runbooks import runbooks_to_prompt
+        rb = runbooks_to_prompt()
+        if rb:
+            parts.append("\n\n" + rb)
+    except Exception:
+        pass
+    return "".join(parts)
+
+
+# For backward compatibility — modules that import SYSTEM_PROMPT directly
+SYSTEM_PROMPT = _BASE

@@ -1,11 +1,9 @@
-# Server (runs on Oracle Cloud) — service.py
+# Server dependencies (service.py + agent.py)
 claude-agent-sdk>=0.0.1
 fastapi>=0.115.0
 uvicorn>=0.34.0
+pyyaml>=6.0
 python-telegram-bot>=21.0
 
-# Local agent (optional, agent.py) — requires ANTHROPIC_API_KEY
-# anthropic>=0.40.0
-
-# Client (runs on any device with Tailscale) — client.py
+# Client dependency (client.py — install on your laptop)
 httpx>=0.28.0

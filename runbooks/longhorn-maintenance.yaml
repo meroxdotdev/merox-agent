@@ -1,0 +1,26 @@
+name: longhorn-maintenance
+description: Longhorn storage health check and maintenance
+trigger: "Storage issues, volume degraded, or Longhorn maintenance needed"
+steps:
+  - name: check_volumes
+    description: "Check all Longhorn volume statuses"
+    command: "kubectl -n longhorn-system get volumes.longhorn.io"
+    pvc: "kubectl get pvc -A"
+
+  - name: check_nodes
+    description: "Check Longhorn node status and disk space"
+    command: "kubectl -n longhorn-system get nodes.longhorn.io -o wide"
+
+  - name: check_replicas
+    description: "Find degraded volumes (replica count < desired)"
+    command: "kubectl -n longhorn-system get replicas.longhorn.io --no-headers | grep -v running"
+
+  - name: common_fixes
+    description: "Common Longhorn fixes"
+    rebuild: "Degraded volume will auto-rebuild if node has space"
+    evict: "Evict replicas from a node before maintenance"
+    backup: "kubectl -n longhorn-system get backups.longhorn.io"
+
+  - name: report
+    log_event: "Longhorn maintenance check"
+    tags: ["storage", "longhorn"]

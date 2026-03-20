@@ -1,0 +1,32 @@
+name: debug-pod
+description: Troubleshoot a pod in CrashLoopBackOff, Error, or Pending state
+trigger: "Pod is unhealthy, crashing, or stuck"
+steps:
+  - name: identify
+    description: "Find the problematic pod"
+    command: "kubectl get pods -A --field-selector status.phase!=Running,status.phase!=Succeeded"
+
+  - name: describe
+    description: "Get pod details and events"
+    command: "kubectl -n {namespace} describe pod {pod}"
+    focus: ["Events:", "Conditions:", "State:", "Last State:"]
+
+  - name: logs
+    description: "Check container logs"
+    current: "kubectl -n {namespace} logs {pod} --tail=50"
+    previous: "kubectl -n {namespace} logs {pod} --previous --tail=50"
+
+  - name: resource_check
+    description: "Check if resource limits are the issue"
+    command: "kubectl -n {namespace} top pod {pod}"
+    node_resources: "kubectl top nodes"
+
+  - name: common_fixes
+    description: "Suggest fixes based on error pattern"
+    crashloop: "Check logs for startup errors, missing config/secrets, or OOMKilled"
+    pending: "Check node resources, PVC binding, or node selectors"
+    imagepull: "Check image name, registry auth, and network connectivity"
+
+  - name: report
+    log_event: "Debugged pod: {namespace}/{pod} - {diagnosis}"
+    tags: ["debug", "pod", "{namespace}"]

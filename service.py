@@ -37,7 +37,7 @@ from claude_agent_sdk import (
 )
 
 from config import MODEL
-from prompt import SYSTEM_PROMPT
+from prompt import build_system_prompt
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ async def run_agent(message: str, session_key: str) -> AsyncGenerator[dict, None
     claude_session_id = _get_session(session_key)
 
     options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=build_system_prompt(),
         allowed_tools=["Bash"],
         permission_mode="default",
         model=MODEL,

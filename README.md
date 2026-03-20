@@ -1,159 +1,188 @@
 # merox-agent
 
-Intelligent infrastructure agent for the merox.dev homelab:
-- **Oracle Cloud server** — Docker services, system health
-- **Kubernetes cluster** — Talos OS, FluxCD GitOps, Longhorn
-- **Website** — merox.dev
+An AI infrastructure agent for homelabs — chat with your server, Kubernetes cluster, and services via Telegram or CLI.
 
-Built with [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) — uses your Claude Code account, no separate API key needed.
+Built with [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python). The agent runs on your server and has full shell access — it can check pod status, restart services, tail logs, run kubectl commands, commit GitOps changes, and anything else you'd do in a terminal.
 
-Interfaces: Telegram bot (phone) + CLI client (laptop).
+**Interfaces:** Telegram bot (phone) · CLI client (laptop) · HTTP API (SSE streaming)
 
 ---
 
-## Disaster recovery — rebuild from zero
+## How it works
 
-Use this if you lose the Oracle server or get a new laptop.
+```
+Phone / Laptop
+    │
+    ├── Telegram bot ──────────────────────┐
+    └── client.py ─── HTTP (Tailscale) ───►│
+                                           │  service.py  (FastAPI)
+                                           │    └── Claude Agent SDK
+                                           │          └── Claude Code CLI
+                                           │                └── Bash
+                                           │                      ├── kubectl / flux / talosctl
+                                           │                      ├── docker / docker compose
+                                           │                      └── git, systemctl, ...
+                                    Oracle Cloud / VPS
+```
 
-### 1. New Oracle Cloud server
+The agent uses Claude Code CLI as its execution engine — no custom tool definitions needed. The system prompt describes your infrastructure; the agent figures out which commands to run.
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- A Linux server (Oracle Cloud Free Tier works great)
+- [Tailscale](https://tailscale.com) on the server (recommended, keeps port 8765 off the internet)
+- Python 3.11+
+- Node.js 20+ and Claude Code CLI, authenticated
 
 ```bash
-# 1. Provision Ubuntu 22.04+ VM on Oracle Cloud (Free Tier works)
-#    Open port 8765 in the security list (or keep it Tailscale-only)
-
-# 2. Install Tailscale and connect to your network
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-# Note the Tailscale IP: tailscale ip -4
-
-# 3. Install Python 3.11+
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
-
-# 4. Install Node.js and Claude Code CLI
+# Install Node.js
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
+
+# Install and authenticate Claude Code
 sudo npm install -g @anthropic-ai/claude-code
+claude  # follow the OAuth prompt
+```
 
-# 5. Authenticate Claude Code (follow the browser OAuth prompt)
-claude
+### Server setup
 
-# 6. Clone the agent repo
+```bash
+# Clone
 sudo git clone https://github.com/meroxdotdev/merox-agent /srv/merox-agent
 cd /srv/merox-agent
 
-# 7. Configure
-sudo cp .env.example .env
-sudo nano .env
-# Fill in: SERVER_TS_IP, INFRA_REPO, WEBSITE_REPO, TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID
+# Configure
+cp .env.example .env
+nano .env  # fill in SERVER_TS_IP, INFRA_REPO, TELEGRAM_BOT_TOKEN, etc.
 
-# 8. Install (creates virtualenv, systemd service, Claude permissions)
+# Install (virtualenv + systemd service)
 sudo bash install.sh
 ```
 
-**That's it.** The agent is running and the Telegram bot is active.
+That's it. Check it's running:
 
-Verify:
 ```bash
 systemctl status merox-agent
 journalctl -u merox-agent -f
 ```
 
----
-
-### 2. New laptop (connect to existing server)
+### Client setup (laptop)
 
 ```bash
-# 1. Install Tailscale and connect
-# 2. Install Python deps
 pip install httpx
-
-# 3. Clone repo (or just grab client.py)
 git clone https://github.com/meroxdotdev/merox-agent
 cd merox-agent
-
-# 4. Configure server URL
 echo "AGENT_SERVER_URL=http://<SERVER_TAILSCALE_IP>:8765" > .env
-
-# 5. Run
 python3 client.py
 ```
 
-Or just use the Telegram bot — no setup needed on the laptop at all.
+Or just use the Telegram bot — no laptop setup needed at all.
 
 ---
 
-### 3. What lives where
+## Adapting for your own homelab
 
-| What | Where | Backed up? |
-|------|-------|------------|
-| Agent code | GitHub (this repo) | ✅ |
-| Infra repo (k8s manifests) | GitHub (meroxdotdev/infrastructure) | ✅ |
-| Website repo | GitHub (meroxdotdev/merox) | ✅ |
-| Server `.env` (Telegram token, IPs) | Only on server | ⚠️ Save it somewhere safe |
-| Kubernetes secrets (SOPS) | Git-encrypted in infra repo | ✅ (need AGE key) |
-| AGE encryption key | `/srv/kubernetes/infrastructure/age.key` | ⚠️ Back this up — losing it = losing all secrets |
+The only file you need to edit is **`prompt.py`**. Change the infrastructure description to match your setup — what servers you have, where your repos live, what services you run.
 
-**The one thing you must back up manually:** the AGE key at `age.key`. Everything else is in git.
+Everything else (memory, runbooks, service wiring) works out of the box.
+
+**Runbooks** — add YAML files in `runbooks/` for standard procedures you want the agent to follow consistently (restart sequences, maintenance steps, etc.). See the existing ones for the format.
+
+**Memory** — the agent reads/writes `memory/notes.json` and `memory/events.jsonl` via Bash. It persists decisions, incidents, and preferences across sessions automatically.
 
 ---
 
 ## Usage
 
-### Telegram (recommended for phone)
-Message `@meroxagentbot` — ask anything about your infra.
-- `/clear` — reset conversation
+### Telegram
 
-### CLI (laptop)
+Message your bot — ask anything about your infra. `/clear` resets the conversation.
+
+```
+what is the status of the cluster?
+which pods are not running?
+show me traefik logs
+how much disk is left?
+reconcile flux-system
+restart jellyfin
+what changed in the infra repo this week?
+```
+
+### CLI client (laptop → server)
+
 ```bash
 python3 client.py                        # interactive
 python3 client.py "what pods are down?"  # one-shot
 ```
 
-### Examples
-```
-what is the status of the cluster?
-which pods are not running?
-show me traefik logs
-how much disk is left on the server?
-what changed in the infra repo recently?
-reconcile flux-system
+### CLI agent (on the server directly)
+
+```bash
+cd /srv/merox-agent
+python3 agent.py                         # interactive
+python3 agent.py "check cluster health"  # one-shot
 ```
 
 ---
-
-## Architecture
-
-```
-Phone/Laptop
-    │
-    ├── Telegram bot ──────────────────────┐
-    └── client.py ─── HTTP (Tailscale) ───►│
-                                           │ service.py (FastAPI)
-                                           │   └── Claude Agent SDK
-                                           │         └── Claude Code CLI
-                                           │               └── Bash tool
-                                           │                     ├── kubectl
-                                           │                     ├── talosctl
-                                           │                     ├── flux
-                                           │                     └── docker
-                                    Oracle Cloud Server
-```
 
 ## Project structure
 
 ```
 merox-agent/
-├── service.py          # HTTP server + Telegram bot
-├── client.py           # CLI client (laptop)
-├── agent.py            # standalone agent (needs ANTHROPIC_API_KEY)
-├── config.py           # configuration from env vars
-├── prompt.py           # system prompt with infra context
-├── tools/
-│   ├── kubernetes.py   # kubectl, flux, talosctl (used by agent.py)
-│   ├── server.py       # docker, systemctl, shell (used by agent.py)
-│   └── git_tools.py    # git operations (used by agent.py)
-├── install.sh          # server setup script
-├── merox-agent.service # systemd unit (generated by install.sh)
+├── service.py          # FastAPI server — HTTP endpoint + Telegram bot
+├── agent.py            # Interactive CLI (runs directly on the server)
+├── client.py           # Thin CLI client for laptop (connects to service.py via HTTP)
+├── config.py           # All settings, loaded from .env
+├── prompt.py           # System prompt — edit this to describe your infrastructure
+├── memory/
+│   ├── cli.py          # Memory read/write CLI (called by the agent via Bash)
+│   ├── events.jsonl    # Action log (gitignored)
+│   └── notes.json      # Key-value notes (gitignored)
+├── runbooks/
+│   └── *.yaml          # Standard procedures (restart, flux reconcile, etc.)
+├── install.sh          # Server setup — virtualenv + systemd service
 ├── requirements.txt
 └── .env.example
 ```
+
+---
+
+## Disaster recovery
+
+### New server
+
+```bash
+# 1. Provision Ubuntu 22.04+ (Oracle Cloud Free Tier, VPS, etc.)
+# 2. Install Tailscale: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+# 3. Install Python: sudo apt update && sudo apt install -y python3 python3-venv git
+# 4. Install Node.js + Claude Code (see Prerequisites above)
+# 5. Clone + configure + install (see Quick start above)
+```
+
+### New laptop
+
+```bash
+# 1. Connect Tailscale
+# 2. pip install httpx
+# 3. Clone repo, set AGENT_SERVER_URL in .env, run python3 client.py
+```
+
+### What lives where
+
+| What | Where | Backed up? |
+|------|-------|------------|
+| Agent code | GitHub (this repo) | ✅ |
+| Infra manifests | GitHub (your infra repo) | ✅ |
+| Server `.env` | Only on server | ⚠️ Save it somewhere safe |
+| K8s secrets (SOPS) | Git-encrypted | ✅ (need AGE key) |
+| AGE key | `/srv/kubernetes/infrastructure/age.key` | ⚠️ Back this up — losing it = losing all secrets |
+
+---
+
+## License
+
+MIT

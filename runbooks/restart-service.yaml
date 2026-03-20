@@ -1,0 +1,31 @@
+name: restart-service
+description: Restart a Docker or Kubernetes service with pre/post verification
+trigger: "User asks to restart a service"
+steps:
+  - name: identify_service
+    description: "Determine if service is Docker or Kubernetes"
+    docker_check: "docker ps --filter name={service} --format '{{.Names}} {{.Status}}'"
+    k8s_check: "kubectl get deploy,statefulset -A | grep -i {service}"
+
+  - name: pre_check
+    description: "Verify current state before restart"
+    docker: "docker logs --tail 20 {service}"
+    k8s: "kubectl -n {namespace} describe pod -l app.kubernetes.io/name={service} | tail -30"
+
+  - name: restart
+    description: "Perform the restart"
+    docker: "docker restart {service}"
+    k8s_deployment: "kubectl -n {namespace} rollout restart deployment/{service}"
+    k8s_statefulset: "kubectl -n {namespace} rollout restart statefulset/{service}"
+    confirm_before: true
+
+  - name: post_check
+    description: "Verify service is healthy after restart"
+    docker: "docker ps --filter name={service} --format '{{.Names}} {{.Status}}'"
+    k8s: "kubectl -n {namespace} get pods -l app.kubernetes.io/name={service}"
+    wait_seconds: 10
+
+  - name: report
+    description: "Log the action to memory"
+    log_event: "Restarted {type} service: {service}"
+    tags: ["restart", "{type}"]

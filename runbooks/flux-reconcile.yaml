@@ -1,0 +1,23 @@
+name: flux-reconcile
+description: Force reconcile a FluxCD HelmRelease or the entire flux system
+trigger: "User asks to reconcile, sync, or force-update a Flux resource"
+steps:
+  - name: check_status
+    description: "Check current HelmRelease status"
+    all: "kubectl get helmreleases -A --no-headers"
+    specific: "kubectl get helmrelease {name} -n {namespace} -o yaml | head -40"
+
+  - name: reconcile
+    description: "Force reconcile"
+    specific: "flux reconcile helmrelease {name} -n {namespace} --with-source"
+    all_sources: "flux reconcile source git flux-system -n flux-system"
+    confirm_before: false
+
+  - name: wait_and_verify
+    description: "Wait for reconciliation to complete"
+    command: "kubectl get helmrelease {name} -n {namespace} -w --timeout=120s"
+    fallback: "kubectl get helmreleases -A"
+
+  - name: report
+    log_event: "Flux reconcile: {name}"
+    tags: ["flux", "reconcile"]
